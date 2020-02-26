@@ -10,6 +10,7 @@ import           Numeric
 import           Lib
 import           Control.Monad.Error
 import           System.IO
+import           Data.IORef
 
 symbol :: Parser Char
 symbol = oneOf "!#$%&|*+-/:<=>?@^_~"
@@ -31,6 +32,20 @@ data LispError = LENumArgs Integer [LispVal]
                | LENotFunction String String
                | LEUnboundVar String String
                | LEDefault String
+
+type Env = IORef [(String, IORef LispVal)]
+
+nullEnv :: IO Env
+nullEnv = newIORef []
+
+type IOThrowsError = ErrorT LispError IO
+
+liftThrows :: ThrowsError a -> IOThrowsError a
+liftThrows (Left  err) = throwError err
+liftThrows (Right val) = return val
+
+runIOThrows :: IOThrowsError String -> IO String
+runIOThrows action = runErrorT (trapError action) >>= return . extractValue
 
 showError :: LispError -> String
 showError (LEUnboundVar     message varname) = message ++ ": " ++ varname
@@ -102,20 +117,23 @@ parseAtom = do
 parseDecimal :: Parser LispVal
 parseDecimal = do
   optional $ try $ string "#d"
+  sign <- fmap (maybe 1 (const (-1))) $ optionMaybe $ char '-'
   digs <- many1 digit
-  return $ LSNumber $ read digs
+  return $ LSNumber $ sign * (read digs)
 
 parseOct :: Parser LispVal
 parseOct = do
   try $ string "#o"
+  sign <- fmap (maybe 1 (const (-1))) $ optionMaybe $ char '-'
   digs <- many1 $ oneOf "01234567"
-  return $ LSNumber $ fst $ readOct digs !! 0
+  return $ LSNumber $ sign * (fst $ readOct digs !! 0)
 
 parseHex :: Parser LispVal
 parseHex = do
   try $ string "#x"
+  sign <- fmap (maybe 1 (const (-1))) $ optionMaybe $ char '-'
   digs <- many1 $ oneOf "0123456789abcdef"
-  return $ LSNumber $ fst $ readHex digs !! 0
+  return $ LSNumber $ sign * (fst $ readHex digs !! 0)
 
 parseNumber :: Parser LispVal
 -- parseNumber = liftM (Number . read) $ many1 digit
@@ -178,13 +196,24 @@ primitives =
   ]
 
 
-eval :: LispVal -> ThrowsError LispVal
-eval val@(LSString _                    ) = return val
-eval val@(LSNumber _                    ) = return val
-eval val@(LSBool   _                    ) = return val
-eval (    LSList   [LSAtom "quote", val]) = return val
-eval (    LSList   (LSAtom func : args) ) = mapM eval args >>= apply func
-eval badForm =
+eval :: Env -> LispVal -> IOThrowsError LispVal
+eval env val@(LSString _                               ) = return val
+eval env val@(LSNumber _                               ) = return val
+eval env val@(LSBool   _                               ) = return val
+eval env (    LSAtom   id                              ) = getVar env id
+eval env (    LSList   [LSAtom "quote", val]           ) = return val
+eval env (    LSList   [LSAtom "if", pred, conseq, alt]) = do
+  result <- eval env pred
+  case result of
+    LSBool False -> eval env alt
+    otherwise    -> eval env conseq
+eval env (LSList [LSAtom "set!", LSAtom var, form]) =
+  eval env form >>= setVar env var
+eval env (LSList [LSAtom "define", LSAtom var, form]) =
+  eval env form >>= defineVar env var
+eval env (LSList (LSAtom func : args)) =
+  mapM (eval env) args >>= liftThrows . apply func
+eval env badForm =
   throwError $ LEBadSpecialForm "Unrecognized special form" badForm
 
 apply :: String -> [LispVal] -> ThrowsError LispVal
@@ -298,12 +327,12 @@ flushStr str = putStr str >> hFlush stdout
 readPrompt :: String -> IO String
 readPrompt prompt = flushStr prompt >> getLine
 
-evalString :: String -> IO String
-evalString expr =
-  return $ extractValue $ trapError (liftM show $ readExpr expr >>= eval)
+evalString :: Env -> String -> IO String
+evalString env expr =
+  runIOThrows $ liftM show $ liftThrows (readExpr expr) >>= eval env
 
-evalAndPrint :: String -> IO ()
-evalAndPrint expr = evalString expr >>= putStrLn
+evalAndPrint :: Env -> String -> IO ()
+evalAndPrint env expr = evalString env expr >>= putStrLn
 
 until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
 until_ pred prompt action = do
@@ -311,12 +340,53 @@ until_ pred prompt action = do
   if pred result then return () else action result >> until_ pred prompt action
 
 runRepl :: IO ()
-runRepl = until_ (== "quit") (readPrompt "Lisp>>> ") evalAndPrint
+runRepl = nullEnv >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
+
+runOne :: String -> IO ()
+runOne expr = nullEnv >>= flip evalAndPrint expr
+
+isBound :: Env -> String -> IO Bool
+isBound envRef var =
+  readIORef envRef >>= return . maybe False (const True) . lookup var
+
+getVar :: Env -> String -> IOThrowsError LispVal
+getVar envRef var = do
+  env <- liftIO $ readIORef envRef
+  maybe (throwError $ LEUnboundVar "Getting an unbound variable: " var)
+        (liftIO . readIORef)
+        (lookup var env)
+
+setVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+setVar envRef var value = do
+  env <- liftIO $ readIORef envRef
+  maybe (throwError $ LEUnboundVar "Setting an unbound variable: " var)
+        (liftIO . (flip writeIORef value))
+        (lookup var env)
+  return value
+
+defineVar :: Env -> String -> LispVal -> IOThrowsError LispVal
+defineVar envRef var value = do
+  alreadyDefined <- liftIO $ isBound envRef var
+  if alreadyDefined
+    then setVar envRef var value >> return value
+    else liftIO $ do
+      valueRef <- newIORef value
+      env      <- readIORef envRef
+      writeIORef envRef ((var, valueRef) : env)
+      return value
+
+bindVars :: Env -> [(String, LispVal)] -> IO Env
+bindVars envRef bindings = readIORef envRef >>= extendEnv bindings >>= newIORef
+ where
+  extendEnv bindings env = liftM (++ env) (mapM addBinding bindings)
+  addBinding (var, value) = do
+    ref <- newIORef value
+    return (var, ref)
 
 main :: IO ()
 main = do
   args <- getArgs
   case length args of
     0         -> runRepl
-    1         -> evalAndPrint $ args !! 0
+    1         -> runOne $ args !! 0
     otherwise -> putStrLn "Program takes only 0 or 1 argument"
