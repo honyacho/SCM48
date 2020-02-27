@@ -24,6 +24,9 @@ data LispVal = LSAtom String
              | LSNumber Integer
              | LSString String
              | LSBool Bool
+             | LSPrimitiveFunc ([LispVal] -> ThrowsError LispVal)
+             | LSFunc {params :: [String], vararg :: (Maybe String), body :: [LispVal], closure :: Env}
+
 
 data LispError = LENumArgs Integer [LispVal]
                | LETypeMismatch String LispVal
@@ -90,6 +93,15 @@ showVal (LSBool   False   ) = "#f"
 showVal (LSList   contents) = "(" ++ unwordsList contents ++ ")"
 showVal (LSDottedList head tail) =
   "(" ++ unwordsList head ++ " . " ++ showVal tail ++ ")"
+showVal (LSPrimitiveFunc _) = "<primitive>"
+showVal (LSFunc { params = args, vararg = varargs, body = body, closure = env })
+  = "(lambda ("
+    ++ unwords (map show args)
+    ++ (case varargs of
+         Nothing  -> ""
+         Just arg -> " . " ++ arg
+       )
+    ++ ") ...)"
 
 escapeStr :: Parser String
 escapeStr = do
@@ -162,9 +174,6 @@ parseQuoted = do
   x <- parseExpr
   return $ LSList [LSAtom "quote", x]
 
--- apply :: String -> [LispVal] -> LispVal
--- apply func args = maybe (Bool False) ($ args) $ lookup func primitives
-
 primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives =
   [ ("+"        , numericBinop (+))
@@ -216,12 +225,8 @@ eval env (LSList (LSAtom func : args)) =
 eval env badForm =
   throwError $ LEBadSpecialForm "Unrecognized special form" badForm
 
-apply :: String -> [LispVal] -> ThrowsError LispVal
-apply func args = maybe
-  (throwError $ LENotFunction "Unrecognized primitive function args" func)
-  ($ args)
-  (lookup func primitives)
-
+apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
+apply (LSPrimitiveFunc func) args = liftThrows $ func args
 
 numericBinop
   :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
