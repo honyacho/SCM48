@@ -26,7 +26,8 @@ data LispVal = LSAtom String
              | LSBool Bool
              | LSPrimitiveFunc ([LispVal] -> ThrowsError LispVal)
              | LSFunc {params :: [String], vararg :: (Maybe String), body :: [LispVal], closure :: Env}
-
+             | IOFunc ([LispVal] -> IOThrowsError LispVal)
+             | Port Handle
 
 data LispError = LENumArgs Integer [LispVal]
                | LETypeMismatch String LispVal
@@ -102,6 +103,8 @@ showVal (LSFunc { params = args, vararg = varargs, body = body, closure = env })
          Just arg -> " . " ++ arg
        )
     ++ ") ...)"
+showVal (Port   _) = "<IO port>"
+showVal (IOFunc _) = "<IO primitive>"
 
 escapeStr :: Parser String
 escapeStr = do
@@ -220,13 +223,51 @@ eval env (LSList [LSAtom "set!", LSAtom var, form]) =
   eval env form >>= setVar env var
 eval env (LSList [LSAtom "define", LSAtom var, form]) =
   eval env form >>= defineVar env var
-eval env (LSList (LSAtom func : args)) =
-  mapM (eval env) args >>= liftThrows . apply func
+eval env (LSList (LSAtom "define" : LSList (LSAtom var : params) : body)) =
+  makeNormalFunc env params body >>= defineVar env var
+eval env (LSList (LSAtom "define" : LSDottedList (LSAtom var : params) varargs : body))
+  = makeVarargs varargs env params body >>= defineVar env var
+eval env (LSList (LSAtom "lambda" : LSList params : body)) =
+  makeNormalFunc env params body
+eval env (LSList (LSAtom "lambda" : LSDottedList params varargs : body)) =
+  makeVarargs varargs env params body
+eval env (LSList (LSAtom "lambda" : varargs@(LSAtom _) : body)) =
+  makeVarargs varargs env [] body
+eval env (LSList (function : args)) = do
+  func    <- eval env function
+  argVals <- mapM (eval env) args
+  apply func argVals
 eval env badForm =
   throwError $ LEBadSpecialForm "Unrecognized special form" badForm
 
 apply :: LispVal -> [LispVal] -> IOThrowsError LispVal
 apply (LSPrimitiveFunc func) args = liftThrows $ func args
+apply (LSFunc params varargs body closure) args =
+  if num params /= num args && varargs == Nothing
+    then throwError $ LENumArgs (num params) args
+    else
+      (liftIO $ bindVars closure $ zip params args)
+      >>= bindVarArgs varargs
+      >>= evalBody
+ where
+  remainingArgs = drop (length params) args
+  num           = toInteger . length
+  evalBody env = liftM last $ mapM (eval env) body
+  bindVarArgs arg env = case arg of
+    Just argName -> liftIO $ bindVars env [(argName, LSList $ remainingArgs)]
+    Nothing      -> return env
+
+primitiveBindings =
+  nullEnv >>= (flip bindVars $ map makePrimitiveFunc primitives)
+  where makePrimitiveFunc (var, func) = (var, LSPrimitiveFunc func)
+
+bindVars :: Env -> [(String, LispVal)] -> IO Env
+bindVars envRef bindings = readIORef envRef >>= extendEnv bindings >>= newIORef
+ where
+  extendEnv bindings env = liftM (++ env) (mapM addBinding bindings)
+  addBinding (var, value) = do
+    ref <- newIORef value
+    return (var, ref)
 
 numericBinop
   :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
@@ -344,11 +385,19 @@ until_ pred prompt action = do
   result <- prompt
   if pred result then return () else action result >> until_ pred prompt action
 
-runRepl :: IO ()
-runRepl = nullEnv >>= until_ (== "quit") (readPrompt "Lisp>>> ") . evalAndPrint
+makeFunc varargs env params body =
+  return $ LSFunc (map showVal params) varargs body env
+makeNormalFunc = makeFunc Nothing
+makeVarargs = makeFunc . Just . showVal
 
 runOne :: String -> IO ()
-runOne expr = nullEnv >>= flip evalAndPrint expr
+runOne expr = primitiveBindings >>= flip evalAndPrint expr
+
+runRepl :: IO ()
+runRepl =
+  primitiveBindings
+    >>= until_ (== "quit") (readPrompt "Lisp>>> ")
+    .   evalAndPrint
 
 isBound :: Env -> String -> IO Bool
 isBound envRef var =
@@ -379,14 +428,6 @@ defineVar envRef var value = do
       env      <- readIORef envRef
       writeIORef envRef ((var, valueRef) : env)
       return value
-
-bindVars :: Env -> [(String, LispVal)] -> IO Env
-bindVars envRef bindings = readIORef envRef >>= extendEnv bindings >>= newIORef
- where
-  extendEnv bindings env = liftM (++ env) (mapM addBinding bindings)
-  addBinding (var, value) = do
-    ref <- newIORef value
-    return (var, ref)
 
 main :: IO ()
 main = do
